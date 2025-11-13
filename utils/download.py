@@ -146,10 +146,11 @@ async def download_video(url: str) -> DownloadResult:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     if _is_instagram_url(url):
+        # Likee kabi tez HTML meta tag parse qilish
         try:
-            return await asyncio.to_thread(_download_instagram_media, url)
+            return await asyncio.to_thread(_download_instagram_via_meta, url)
         except DownloadError as error:
-            logging.info("Instagram JSON API ishlamadi, yt-dlp ga o'tilmoqda: %s", error)
+            logging.info("Instagram meta tag ishlamadi, yt-dlp ga o'tilmoqda: %s", error)
             return await _download_with_ytdlp(url, ensure_playable=False)
 
     if _is_tiktok_url(url):
@@ -873,3 +874,71 @@ def _find_stream(probe_data: dict, stream_type: str) -> Optional[dict]:
         if stream.get("codec_type") == stream_type:
             return stream
     return None
+
+def _download_instagram_via_meta(url: str) -> DownloadResult:
+    """Instagram videoni Likee kabi tez meta tag orqali yuklash."""
+    session = requests.Session()
+    session.headers.update(INSTAGRAM_HEADERS)
+
+    try:
+        response = session.get(url, timeout=INSTAGRAM_REQUEST_TIMEOUT, allow_redirects=True)
+    except requests.RequestException as error:
+        logging.exception("Instagram sahifasini olishda xato", exc_info=error)
+        raise DownloadError("Instagram videosini olishda xato yuz berdi.") from error
+
+    if response.status_code == 404:
+        raise DownloadError("Instagram havolasi topilmadi yoki o'chirilgan.")
+
+    if not response.ok:
+        logging.warning("Instagram sahifasi status kodi: %s", response.status_code)
+        raise DownloadError("Instagram videosini olishda xato yuz berdi.")
+
+    referer_url = response.url
+    page_html = response.text
+
+    video_url = _extract_meta_content(
+        page_html,
+        ("og:video:secure_url", "og:video:url", "og:video"),
+    )
+    if not video_url:
+        match = re.search(r'"video_url"\s*:\s*"(.*?)"', page_html)
+        if match:
+            video_url = _decode_json_string(match.group(1))
+    if not video_url:
+        raise DownloadError("Instagram video havolasi topilmadi.")
+
+    video_url = _normalize_remote_url(video_url, referer_url)
+
+    title = _extract_meta_content(page_html, ("og:title", "twitter:title")) or "Instagram video"
+
+    duration: Optional[float] = None
+    duration_raw = _extract_meta_content(page_html, ("og:video:duration", "video:duration"))
+    if duration_raw:
+        try:
+            duration = float(duration_raw)
+        except ValueError:
+            duration = None
+
+    download_headers = {
+        "User-Agent": INSTAGRAM_HEADERS["User-Agent"],
+        "Referer": referer_url,
+    }
+
+    file_path = DOWNLOAD_DIR / f"{uuid.uuid4().hex}.mp4"
+
+    _download_file_from_url(video_url, file_path, headers=download_headers, timeout=40)
+
+    try:
+        if file_path.stat().st_size < 64 * 1024:
+            raise DownloadError("Instagram bo'sh video fayl qaytardi.")
+    except FileNotFoundError as error:
+        raise DownloadError("Instagram video fayli topilmadi.") from error
+
+    return DownloadResult(
+        file_path=file_path,
+        title=title,
+        duration=duration,
+        ext="mp4",
+        media_type="video",
+    )
+

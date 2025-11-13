@@ -42,7 +42,12 @@ def ensure_database() -> None:
 
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
-                username TEXT
+                username TEXT,
+                can_manage_users INTEGER DEFAULT 1,
+                can_manage_channels INTEGER DEFAULT 1,
+                can_broadcast INTEGER DEFAULT 1,
+                can_view_stats INTEGER DEFAULT 1,
+                can_manage_admins INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS channels (
@@ -64,7 +69,29 @@ def ensure_database() -> None:
             );
             """
         )
+        _migrate_admin_permissions(connection)
         _populate_default_settings(connection)
+
+
+def _migrate_admin_permissions(connection: sqlite3.Connection) -> None:
+    """Add admin permission columns if they don't exist (migration)."""
+    cursor = connection.cursor()
+    cursor.execute("PRAGMA table_info(admins)")
+    columns = [row[1] for row in cursor.fetchall()]
+    
+    permission_columns = [
+        ("can_manage_users", "INTEGER DEFAULT 1"),
+        ("can_manage_channels", "INTEGER DEFAULT 1"),
+        ("can_broadcast", "INTEGER DEFAULT 1"),
+        ("can_view_stats", "INTEGER DEFAULT 1"),
+        ("can_manage_admins", "INTEGER DEFAULT 0"),
+    ]
+    
+    for column_name, column_type in permission_columns:
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE admins ADD COLUMN {column_name} {column_type}")
+    
+    connection.commit()
 
 
 @contextmanager
