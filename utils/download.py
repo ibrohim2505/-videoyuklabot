@@ -47,6 +47,7 @@ SUPPORTED_DOMAINS = (
 )
 
 INSTAGRAM_REQUEST_TIMEOUT = 20
+LIKEE_REQUEST_TIMEOUT = 20
 
 _settings = get_settings()
 
@@ -58,6 +59,20 @@ INSTAGRAM_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "X-IG-App-ID": "936619743392459",
 }
+
+LIKEE_PAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 "
+        "Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://likee.video/",
+}
+
+_META_TAG_RE = re.compile(r"<meta\s+[^>]+>", re.IGNORECASE)
+_ATTR_RE = re.compile(r"([a-zA-Z_:]+)\s*=\s*\"([^\"]*)\"")
 
 
 class DownloadError(RuntimeError):
@@ -71,6 +86,29 @@ class DownloadResult:
     duration: Optional[float]
     ext: str
     media_type: str = "video"  # "video" yoki "photo"
+
+
+def _extract_meta_content(page_html: str, keys: tuple[str, ...]) -> Optional[str]:
+    lowered = {key.lower() for key in keys}
+    for tag_match in _META_TAG_RE.finditer(page_html):
+        raw_tag = tag_match.group(0)
+        attrs = {name.lower(): value for name, value in _ATTR_RE.findall(raw_tag)}
+        meta_key = attrs.get("property") or attrs.get("name")
+        if meta_key and meta_key.lower() in lowered:
+            content = attrs.get("content")
+            if content:
+                return html.unescape(content.strip())
+    return None
+
+
+def _decode_json_string(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except json.JSONDecodeError:
+        try:
+            return value.encode("utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            return value
 
 
 def is_supported_url(url: str) -> bool:
@@ -121,7 +159,11 @@ async def download_video(url: str) -> DownloadResult:
         return await _download_with_ytdlp(url, ensure_playable=False)
 
     if _is_likee_url(url):
-        return await _download_with_ytdlp(url, ensure_playable=False)
+        try:
+            return await asyncio.to_thread(_download_likee_media, url)
+        except DownloadError as error:
+            logging.info("Likee sahifasi to'g'ridan-to'g'ri olinmadi, yt-dlp sinab ko'riladi: %s", error)
+            return await _download_with_ytdlp(url, ensure_playable=False)
 
     if _is_youtube_url(url):
         return await _download_with_ytdlp(url, ensure_playable=False)
@@ -321,6 +363,77 @@ async def _download_tiktok_media(url: str) -> DownloadResult:
     except DownloadError as error:
         logging.error("TikTok video ssstik orqali ham yuklanmadi: %s", error)
         raise
+
+
+def _download_likee_media(url: str) -> DownloadResult:
+    session = requests.Session()
+    session.headers.update(LIKEE_PAGE_HEADERS)
+
+    try:
+        response = session.get(url, timeout=LIKEE_REQUEST_TIMEOUT, allow_redirects=True)
+    except requests.RequestException as error:
+        logging.exception("Likee sahifasini olishda xato", exc_info=error)
+        raise DownloadError("Likee videosini olishda xato yuz berdi.") from error
+
+    if response.status_code == 404:
+        raise DownloadError("Likee havolasi topilmadi yoki o'chirilgan.")
+
+    if not response.ok:
+        logging.warning("Likee sahifasi status kodi: %s", response.status_code)
+        raise DownloadError("Likee videosini olishda xato yuz berdi.")
+
+    referer_url = response.url
+    final_url = referer_url.rstrip("/")
+    if final_url.lower() in {"https://likee.video", "https://www.likee.video", "https://like.video", "https://www.like.video"}:
+        raise DownloadError("Likee havolasi yaroqsiz yoki video o'chirilgan.")
+
+    page_html = response.text
+
+    video_url = _extract_meta_content(
+        page_html,
+        ("og:video:secure_url", "og:video:url", "og:video"),
+    )
+    if not video_url:
+        match = re.search(r'"video_url"\s*:\s*"(.*?)"', page_html)
+        if match:
+            video_url = _decode_json_string(match.group(1))
+    if not video_url:
+        raise DownloadError("Likee video havolasi topilmadi.")
+
+    video_url = _normalize_remote_url(video_url, final_url)
+
+    title = _extract_meta_content(page_html, ("og:title", "twitter:title")) or "Likee video"
+
+    duration: Optional[float] = None
+    duration_raw = _extract_meta_content(page_html, ("og:video:duration", "video:duration"))
+    if duration_raw:
+        try:
+            duration = float(duration_raw)
+        except ValueError:
+            duration = None
+
+    download_headers = {
+        "User-Agent": LIKEE_PAGE_HEADERS["User-Agent"],
+        "Referer": referer_url,
+    }
+
+    file_path = DOWNLOAD_DIR / f"{uuid.uuid4().hex}.mp4"
+
+    _download_file_from_url(video_url, file_path, headers=download_headers, timeout=40)
+
+    try:
+        if file_path.stat().st_size < 64 * 1024:
+            raise DownloadError("Likee bo'sh video fayl qaytardi.")
+    except FileNotFoundError as error:
+        raise DownloadError("Likee video fayli topilmadi.") from error
+
+    return DownloadResult(
+        file_path=file_path,
+        title=title,
+        duration=duration,
+        ext="mp4",
+        media_type="video",
+    )
 
 
 def _download_tiktok_via_ssstik(url: str) -> DownloadResult:
