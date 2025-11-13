@@ -1,0 +1,8 @@
+aiogram>=3.3
+pydantic>=2.5
+pydantic-settings>=2.2
+python-dotenv>=1.0
+pandas>=2.1
+yt-dlp>=2023.11.16
+ffmpeg-python>=0.2
+requests>=2.31
